@@ -1,0 +1,112 @@
+import evaluate
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import pandas as pd
+from tqdm import tqdm
+import json
+import pickle
+import numpy as np
+
+"""
+this file run QG inference with bleu/rouge/meteor metrics
+
+"""
+
+class QGinference():
+    def __init__(self, dataset = "qg", tokenizer = "google-t5/t5-large", model = "iarfmoose/t5-base-question-generator"):
+        # evaluate metrics
+        self.model_name = model
+        self.eval_rouge = evaluate.load('rouge')
+        self.eval_bleu = evaluate.load('bleu')
+        self.eval_meteor = evaluate.load('meteor')
+        self.eval_rquge = evaluate.load('alirezamsh/rquge')
+        self.bertscore = evaluate.load("bertscore")
+
+        self.eval = {'rougeL':self.eval_rouge, 'bleu':self.eval_bleu, 'meteor':self.eval_meteor}
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        
+        # model init
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model).to('cuda')
+        print("done loading model")
+
+        # load dataset
+        print("start loading dataset")
+        self.dataset = self.load_dataset()
+        print("done dataset loading")
+        
+    
+    def load_dataset(self):
+        with open("enlarged_eval.pickle", "rb") as fp:
+            enlarged_eval = pickle.load(fp)
+                
+        return enlarged_eval
+    
+    def evaluate(self, predictions:list, references:list):
+        results = [self.eval[metric].compute(predictions=predictions, references=references)[metric] for metric in self.eval]
+        bertscore = self.bertscore.compute(predictions=predictions, references=references, lang='en')
+        return {"rougeL": results[0], "bleu": results[1], "meteor":results[2], "bert-f1": np.mean(bertscore['f1'])}
+    
+    def prepare_prompt(self, context, answer):
+        text = f"<answer> {answer} \n <context> {context} \n <question> "
+        return text
+
+# results = self.eval_rquge.compute(generated_questions=generated_questions, contexts=contexts, answers=answers, device=device)
+    def run_inference(self):
+        data = self.dataset
+        predictions = []
+        ground_truth = []
+        print("start running inference")
+        
+        for instance in tqdm(data, total = len(data)):
+            context, answer, question = instance[0], instance[1], instance[2]
+            ground_truth.append(question[0])
+            input = self.prepare_prompt(context, answer)
+            encoding = self.tokenizer.encode_plus(input, return_tensors="pt")
+            input_ids, attention_masks = encoding["input_ids"].to("cuda"), encoding["attention_mask"].to("cuda")
+            outputs = self.model.generate(
+                input_ids=input_ids, attention_mask=attention_masks,
+                max_length=50,
+                temperature = 1.5,
+                do_sample=True,
+                top_k=90,
+                top_p=0.5,
+                # max_length=50,
+                # temperature = 0.5,
+                # do_sample=True,
+                # top_p=0.5,
+                # num_return_sequences=1
+            )
+            line = self.tokenizer.decode(outputs[0], skip_special_tokens=True,clean_up_tokenization_spaces=True)
+            predictions.append(line)
+        
+        print("start evaluating")
+        result = self.evaluate(predictions, ground_truth)
+        rquge = self.eval_rquge.compute(generated_questions=predictions, contexts=[i[0] for i in data], answers=[i[1] for i in data], device=self.device)
+        result['rquge'] = rquge['mean_score']
+        print(result)
+        try:
+            x = pd.DataFrame([predictions, ground_truth]).T
+            x.columns = ['prediction', 'ground truth']
+            x.to_csv((self.model_name).split('/')[-1] + '.csv')
+            # x.to_csv('ourfinetuned-t5-large.csv')
+        except:
+            pass
+        return result
+
+        
+if __name__ == "__main__":
+    # "iarfmoose/t5-base-question-generator"
+
+    # exp1 = QGinference(tokenizer='facebook/bart-large', model='facebook/bart-large')
+    # print("Baseline1 facebook bart large: ", exp1.run_inference())
+    # exp2 = QGinference(tokenizer= "google-t5/t5-large", model="google-t5/t5-large")
+    # print("Baseline2 finetuned t5 large QG: ", exp2.run_inference())
+    # exp2 = QGinference(tokenizer= "google-t5/t5-large", model="/home/tzujohsu/SI630/Question-answer-Generation/outputs/model_files")
+    # print("Our finetuned t5 base QG: ", exp2.run_inference())
+    # /home/tzujohsu/llm598/distilling-step-by-step/ckpts/svamp/t5-v1_1-base/standard/palm/1.0/llm/0.5/1024/64/AdamW/5e-05/0/model_files
+    exp2 = QGinference(tokenizer= "google/t5-v1_1-base", model="/home/tzujohsu/llm598/distilling-step-by-step/ckpts/qg/t5-v1_1-base/standard/None/1.0/gt/0.5/1024/64/AdamW/5e-05/0/model_files")
+    print("Our finetuned t5 base QG: ", exp2.run_inference())
+    # exp2 = QGinference(tokenizer= "facebook/opt-350m", model="facebook/opt-350m")
+    # print("facebook/opt-350m QG: ", exp2.run_inference())
